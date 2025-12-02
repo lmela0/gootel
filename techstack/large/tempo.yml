@@ -1,0 +1,36 @@
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9096
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  lifecycler:
+    address: ${TEMPO_ADDRESS}
+    ring:
+      replication_factor: 1
+
+memberlist:
+  bind_addr: 
+    - 0.0.0.0
+  join_members: 
+    - tempo:7946
+
+compactor:
+  compaction:
+    compaction_window: 5m
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /tmp/tempo/blocks
+    wal:
+      path: /tmp/tempo/wal
