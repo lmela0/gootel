@@ -6,6 +6,7 @@ import (
 )
 
 var (
+	ErrConfigLoad            error             = errors.New("error loading OTel configuration")
 	ErrOtelNewResource       error             = errors.New("error creating new OTel resource")
 	ErrOtelNewLogProvider    error             = errors.New("error creating new Log provider")
 	ErrOtelNewLogger         error             = errors.New("error creating new Logger")

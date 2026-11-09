@@ -8,6 +8,8 @@ golang opentelemetry instrumentation library reduce setup effort
 
 **GOOtel** [ /'gu:tɛl/  a.k.a. **gutel** ] 
 
+> Requires **Go 1.26+**. Dependencies are kept aligned with the latest OpenTelemetry Go release.
+
 ### Minimal library interface export
   - NewGOOtel(ctx context.Context, config *GOOtelConfig) (*GOOtel, error)
     - which returns a pointer to a GOOtel structure
@@ -73,11 +75,18 @@ func main() {
 		log.Fatal("cannot load gootel config:", err)
 	}
 	defer func() {
-		tel.Shutdown()
+		if err := tel.Shutdown(); err != nil {
+			log.Printf("error shutting down telemetry: %v", err)
+		}
 	}()
     // omissis...
 }
 ```
+
+Configuration values explicitly set in `GOOtelConfig` take precedence over
+environment variables; missing values are filled from the standard `OTEL_*`
+variables and finally from library defaults. Endpoints accept both
+`host:port` and full URLs such as `http://collector:4317` (`https` enables TLS).
 
 ### gootel/gonfigurator
 
@@ -98,7 +107,9 @@ func main() {
 	cfg := gootel.GOOtelConfig{}
     // fetch from env
 	envOption := gonfigurator.EnvOption{}
-	cfg.LoadWithDefaults(envOption)
+	if err := cfg.LoadWithDefaults(envOption); err != nil {
+		log.Fatal("cannot load config:", err)
+	}
 
 	fmt.Printf("Config loaded:\n")
 	fmt.Printf("\tServiceName: %s\n", cfg.ServiceName)
@@ -173,7 +184,7 @@ You can easily load data in this way
 // Config loaded:
 //     Server.Port: 8080
 //     Server.Debug: true
-//     AllowedUsers: [[user1 user2]]
+//     AllowedUsers: [user1 user2]
 //     Database.Host: localhost
 //     Database.MaxConnections: 10
 ```

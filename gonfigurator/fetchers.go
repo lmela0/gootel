@@ -1,7 +1,7 @@
 package gonfigurator
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -18,19 +18,9 @@ type DataFetcher interface {
 type EnvFetcher struct{}
 
 func (f EnvFetcher) GetValue(key string, targetKind reflect.Kind) (string, error) {
-	value := os.Getenv(key)
-	if value == "" {
-		found := false
-		for _, envVar := range os.Environ() {
-			if len(envVar) > len(key) && envVar[:len(key)] == key && envVar[len(key)] == '=' {
-				found = true
-				value = envVar[len(key):]
-				break
-			}
-		}
-		if !found {
-			return "", errors.New("key not found")
-		}
+	value, ok := os.LookupEnv(key)
+	if !ok {
+		return "", fmt.Errorf("%w: %s", ErrKeyNotFound, key)
 	}
 	return value, nil
 }
@@ -42,33 +32,30 @@ type JsonFetcher struct {
 
 func (f JsonFetcher) GetValue(key string, targetKind reflect.Kind) (string, error) {
 	if f.Data == nil {
-		return "", errors.New("JSON data not loaded")
+		return "", fmt.Errorf("JSON data not loaded")
 	}
-	keys := strings.Split(key, ".")
-	currentData := f.Data
 
-	var value any
-	for i, k := range keys {
-		if i == len(keys)-1 {
-			val, ok := currentData[k]
-			if !ok {
-				return "", fmt.Errorf("key not found '%s'", key)
-			}
-			value = val
-		} else {
-			nextData, ok := currentData[k].(map[string]any)
-			if !ok {
-				return "", fmt.Errorf("path '%s' not a JSON object", k)
-			}
-			currentData = nextData
+	var current any = f.Data
+	for _, k := range strings.Split(key, ".") {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("path '%s' is not a JSON object", k)
 		}
+		value, ok := object[k]
+		if !ok {
+			return "", fmt.Errorf("%w: %s", ErrKeyNotFound, key)
+		}
+		current = value
 	}
-	if value == nil {
+
+	if current == nil {
 		return "", nil
 	}
-	switch v := value.(type) {
+	switch v := current.(type) {
 	case string:
 		return v, nil
+	case json.Number:
+		return v.String(), nil
 	case float64:
 		if float64(int64(v)) == v {
 			return strconv.FormatInt(int64(v), 10), nil
@@ -76,7 +63,13 @@ func (f JsonFetcher) GetValue(key string, targetKind reflect.Kind) (string, erro
 		return strconv.FormatFloat(v, 'f', -1, 64), nil
 	case bool:
 		return strconv.FormatBool(v), nil
+	case []any:
+		values := make([]string, len(v))
+		for i, item := range v {
+			values[i] = fmt.Sprint(item)
+		}
+		return strings.Join(values, ","), nil
 	default:
-		return fmt.Sprintf("%v", value), nil
+		return "", fmt.Errorf("unsupported JSON value type %T for key '%s'", current, key)
 	}
 }
