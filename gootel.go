@@ -2,18 +2,19 @@ package gootel
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	stdlog "log/slog"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/lmela0/gootel/gonfigurator"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
 	ometric "go.opentelemetry.io/otel/metric"
 	otrace "go.opentelemetry.io/otel/trace"
-
-	stdlog "log/slog"
 
 	otelsdklog "go.opentelemetry.io/otel/sdk/log"
 	otelsdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -24,8 +25,38 @@ import (
 	otlpmetricgrpc "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	otlptracegrpc "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 
-	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
+
+const shutdownTimeout = 5 * time.Second
+
+// shutdowner is implemented by all OpenTelemetry providers.
+type shutdowner interface {
+	Shutdown(context.Context) error
+}
+
+// otlpEndpoint is the normalized form of a configured OTLP endpoint.
+type otlpEndpoint struct {
+	host   string
+	secure bool
+}
+
+// parseEndpoint accepts both "host:port" and full URLs such as
+// "http://collector:4317". Plain host:port endpoints are considered insecure,
+// while https URLs enable TLS.
+func parseEndpoint(raw string) otlpEndpoint {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return otlpEndpoint{host: DefaultEndpoint}
+	}
+	if u, err := url.Parse(raw); err == nil && u.Scheme != "" && u.Host != "" {
+		return otlpEndpoint{
+			host:   u.Host,
+			secure: strings.EqualFold(u.Scheme, "https"),
+		}
+	}
+	return otlpEndpoint{host: raw}
+}
 
 // GOOtel embed OpenTelemetry datastructures to orchestrate telemetry
 type GOOtel struct {
@@ -37,77 +68,107 @@ type GOOtel struct {
 	tracer        otrace.Tracer
 }
 
-// NewGOOtel build a GOOtel object using selected configuration
+// NewGOOtel builds a GOOtel object using the selected configuration.
+// If config is nil, defaults are loaded from the process environment.
 func NewGOOtel(ctx context.Context, config *GOOtelConfig) (*GOOtel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if config == nil {
 		config = &GOOtelConfig{}
-		config.LoadWithDefaults(gonfigurator.EnvOption{})
 	}
-	resource, err := newOTelResource(config.ServiceName, config.ServiceVersion)
+	if err := config.applyEnvDefaults(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrConfigLoad, err)
+	}
+
+	resource, err := newOTelResource(ctx, config.ServiceName, config.ServiceVersion)
 	if err != nil {
-		// handle
-		return nil, ErrOtelNewResource
+		return nil, fmt.Errorf("%w: %w", ErrOtelNewResource, err)
 	}
+
+	// Track every successfully created provider so a partial initialization
+	// can be cleaned up without leaking exporters or background goroutines.
+	var created []shutdowner
+	cleanup := func(cause error) error {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		for i := len(created) - 1; i >= 0; i-- {
+			if err := created[i].Shutdown(shutdownCtx); err != nil {
+				cause = errors.Join(cause, err)
+			}
+		}
+		return cause
+	}
+
 	lp, err := newLogProvider(ctx, resource, config.LogsEndpoint)
 	if err != nil {
-		// handle
-		return nil, ErrOtelNewLogProvider
-
+		return nil, cleanup(fmt.Errorf("%w: %w", ErrOtelNewLogProvider, err))
 	}
+	created = append(created, lp)
+
 	logger, err := newLogger(config.ServiceName, lp)
 	if err != nil {
-		// handle
-		return nil, ErrOtelNewLogger
+		return nil, cleanup(fmt.Errorf("%w: %w", ErrOtelNewLogger, err))
 	}
 
 	mp, err := newMeterProvider(ctx, resource, config.MetricsEndpoint)
 	if err != nil {
-		// handle
-		return nil, ErrOtelNewMeterProvider
-
+		return nil, cleanup(fmt.Errorf("%w: %w", ErrOtelNewMeterProvider, err))
 	}
-	metricOpts := []ometric.MeterOption{}
-	meter := mp.Meter(config.ServiceName, metricOpts...)
+	created = append(created, mp)
 
 	tp, err := newTracerProvider(ctx, resource, config.TracesEndpoint)
 	if err != nil {
-		// handle
-		return nil, ErrOtelNewTracerProvider
+		return nil, cleanup(fmt.Errorf("%w: %w", ErrOtelNewTracerProvider, err))
 	}
-	tracerOpts := []otrace.TracerOption{}
-	tracer := tp.Tracer(config.ServiceName, tracerOpts...)
-	otel := GOOtel{
+	created = append(created, tp)
+
+	// Publish the providers only after the whole setup succeeded.
+	otel.SetTracerProvider(tp)
+	otel.SetMeterProvider(mp)
+	otel.SetLoggerProvider(lp)
+
+	ot := &GOOtel{
 		logProvider:   lp,
 		logger:        logger,
 		meterProvider: mp,
-		meter:         meter,
+		meter:         mp.Meter(config.ServiceName),
 		traceProvider: tp,
-		tracer:        tracer,
+		tracer:        tp.Tracer(config.ServiceName),
 	}
-	fmt.Printf("OpenTelemetry service configured and ready.\nEndpoints:\n\tMetrics:%s\n\tTraces:%s\n\tLogs:%s\n",
-		config.MetricsEndpoint, config.TracesEndpoint, config.LogsEndpoint,
+	logger.Info("OpenTelemetry service configured and ready",
+		stdlog.String("metrics_endpoint", config.MetricsEndpoint),
+		stdlog.String("traces_endpoint", config.TracesEndpoint),
+		stdlog.String("logs_endpoint", config.LogsEndpoint),
 	)
-	return &otel, nil
+	return ot, nil
 }
 
-// newOTelResource create and initialize an otel Resource
-func newOTelResource(serviceName, serviceVersion string) (*otelsdkresource.Resource, error) {
-	hostName, _ := os.Hostname()
-	res := otelsdkresource.NewWithAttributes(
-		semconv.SchemaURL,
+// newOTelResource creates and initializes an OTel resource. The default
+// resource is merged so SDK and OTEL_RESOURCE_ATTRIBUTES metadata are kept.
+func newOTelResource(ctx context.Context, serviceName, serviceVersion string) (*otelsdkresource.Resource, error) {
+	attrs := []attribute.KeyValue{
 		semconv.ServiceName(serviceName),
 		semconv.ServiceVersion(serviceVersion),
-		semconv.HostName(hostName),
 		attribute.String("application.language", "go"),
+	}
+	if hostName, err := os.Hostname(); err == nil && hostName != "" {
+		attrs = append(attrs, semconv.HostName(hostName))
+	}
+	return otelsdkresource.Merge(
+		otelsdkresource.DefaultWithContext(ctx),
+		otelsdkresource.NewWithAttributes(semconv.SchemaURL, attrs...),
 	)
-	return res, nil
 }
 
 // newLogProvider create and initialize an otel LoggerProvider
 func newLogProvider(ctx context.Context, res *otelsdkresource.Resource, endpoint string) (*otelsdklog.LoggerProvider, error) {
-	logExporter, err := otlploggrpc.New(ctx,
-		otlploggrpc.WithEndpoint(endpoint),
-		otlploggrpc.WithInsecure())
+	ep := parseEndpoint(endpoint)
+	opts := []otlploggrpc.Option{otlploggrpc.WithEndpoint(ep.host)}
+	if !ep.secure {
+		opts = append(opts, otlploggrpc.WithInsecure())
+	}
+	logExporter, err := otlploggrpc.New(ctx, opts...)
 	if err != nil {
 		return nil, ErrLogExporter(err)
 	}
@@ -122,27 +183,28 @@ func newLogProvider(ctx context.Context, res *otelsdkresource.Resource, endpoint
 
 // newTracerProvider create and initialize an otel TracerProvider
 func newTracerProvider(ctx context.Context, res *otelsdkresource.Resource, endpoint string) (*otelsdktrace.TracerProvider, error) {
-	clientOpts := []otlptracegrpc.Option{
-		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(), // Usa l'insecure per default
+	ep := parseEndpoint(endpoint)
+	clientOpts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(ep.host)}
+	if !ep.secure {
+		clientOpts = append(clientOpts, otlptracegrpc.WithInsecure())
 	}
 	traceExporter, err := otlptracegrpc.New(ctx, clientOpts...)
 	if err != nil {
 		return nil, ErrTraceExporter(err)
 	}
 	tp := otelsdktrace.NewTracerProvider(
-		otelsdktrace.WithBatcher(traceExporter, otelsdktrace.WithExportTimeout(time.Second)),
+		otelsdktrace.WithBatcher(traceExporter),
 		otelsdktrace.WithResource(res),
 	)
-	otel.SetTracerProvider(tp)
 	return tp, nil
 }
 
 // newMeterProvider create and initialize an otel MeterProvider
 func newMeterProvider(ctx context.Context, res *otelsdkresource.Resource, endpoint string) (*otelsdkmetric.MeterProvider, error) {
-	metricClientOpts := []otlpmetricgrpc.Option{
-		otlpmetricgrpc.WithEndpoint(endpoint),
-		otlpmetricgrpc.WithInsecure(),
+	ep := parseEndpoint(endpoint)
+	metricClientOpts := []otlpmetricgrpc.Option{otlpmetricgrpc.WithEndpoint(ep.host)}
+	if !ep.secure {
+		metricClientOpts = append(metricClientOpts, otlpmetricgrpc.WithInsecure())
 	}
 	metricExporter, err := otlpmetricgrpc.New(ctx, metricClientOpts...)
 	if err != nil {
@@ -159,10 +221,12 @@ func newMeterProvider(ctx context.Context, res *otelsdkresource.Resource, endpoi
 		),
 		otelsdkmetric.WithResource(res),
 	)
-	otel.SetMeterProvider(mp)
 	return mp, nil
 }
 
+// concatOptions prepends a description and a unit to the provided options.
+// T must be one of the otel/metric option interfaces; the values returned by
+// WithDescription and WithUnit implement all of them.
 func concatOptions[T any](descr, unit string, options ...T) []T {
 	opts := []T{
 		ometric.WithDescription(descr).(T),
@@ -178,34 +242,52 @@ func concatOptions[T any](descr, unit string, options ...T) []T {
 // ------------------------------------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------------------------------------
 
-func (ot *GOOtel) Shutdown() {
-	// max 5 sec timeout
-	ctxTimeout, cancel := context.WithTimeout(context.Background(), time.Second*5)
+// Shutdown flushes and stops every provider created by NewGOOtel.
+// It returns the combined errors from all providers.
+func (ot *GOOtel) Shutdown() error {
+	if ot == nil {
+		return nil
+	}
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	// Shutdown del Tracer Provider
-	if err := ot.traceProvider.Shutdown(ctxTimeout); err != nil {
-		fmt.Printf("error shutting down tracer provider: %v", err)
+
+	var errs []error
+	if ot.traceProvider != nil {
+		if err := ot.traceProvider.Shutdown(ctxTimeout); err != nil {
+			errs = append(errs, fmt.Errorf("shutdown tracer provider: %w", err))
+		}
 	}
-	// Shutdown del Meter Provider
-	if err := ot.meterProvider.Shutdown(ctxTimeout); err != nil {
-		fmt.Printf("error shutting down meter provider: %v", err)
+	if ot.meterProvider != nil {
+		if err := ot.meterProvider.Shutdown(ctxTimeout); err != nil {
+			errs = append(errs, fmt.Errorf("shutdown meter provider: %w", err))
+		}
 	}
-	// Shutdown del Log Provider
-	if err := ot.logProvider.Shutdown(ctxTimeout); err != nil {
-		fmt.Printf("error shutting down log provider: %v", err)
+	if ot.logProvider != nil {
+		if err := ot.logProvider.Shutdown(ctxTimeout); err != nil {
+			errs = append(errs, fmt.Errorf("shutdown log provider: %w", err))
+		}
 	}
-	fmt.Println("providers correctly closed.")
+	return errors.Join(errs...)
 }
 
 func (ot *GOOtel) LogWarn(msg string, args ...any) {
+	if ot == nil || ot.logger == nil {
+		return
+	}
 	ot.logger.Warn(msg, args...)
 }
 
 func (ot *GOOtel) LogInfo(msg string, args ...any) {
+	if ot == nil || ot.logger == nil {
+		return
+	}
 	ot.logger.Info(msg, args...)
 }
 
 func (ot *GOOtel) LogError(msg string, args ...any) {
+	if ot == nil || ot.logger == nil {
+		return
+	}
 	ot.logger.Error(msg, args...)
 }
 
